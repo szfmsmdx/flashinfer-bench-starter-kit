@@ -1,8 +1,10 @@
 [solution]
-name = "my-team-solution-v1"      # Solution name
-definition = "fused_moe"          # Track: fused_moe | sparse_attention | gated_delta_net
-author = "team-name"              # Team/author name
+name = "gdn-baseline-v1"
+definition = "gdn_decode_qk4_v8_d128_k_last"  # Switch to gdn_prefill_qk4_v8_d128_k_last for prefill
+author = "team-name"
 
 [build]
-language = "triton"               # triton | cuda
-entry_point = "kernel"            # Kernel function name
+language = "triton"  # triton | cuda
+entry_point = "kernel.py::gdn_decode_kernel"  # Switch to kernel.py::gdn_prefill_kernel for prefill
+destination_passing_style = false
+dependencies = []

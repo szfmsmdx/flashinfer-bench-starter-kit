@@ -53,11 +53,16 @@ def pack_solution(output_path: Path = None) -> Path:
         raise FileNotFoundError(f"Source directory not found: {source_dir}")
 
     # Create build spec
-    spec = BuildSpec(
-        language=language,
-        target_hardware=["cuda"],
-        entry_point=entry_point,
-    )
+    spec_kwargs = {
+        "language": language,
+        "target_hardware": ["cuda"],
+        "entry_point": entry_point,
+    }
+    for optional_key in ("dependencies", "destination_passing_style", "binding"):
+        if optional_key in build_config:
+            spec_kwargs[optional_key] = build_config[optional_key]
+
+    spec = BuildSpec(**spec_kwargs)
 
     # Pack the solution
     solution = pack_solution_from_files(
@@ -78,6 +83,7 @@ def pack_solution(output_path: Path = None) -> Path:
     print(f"  Definition: {solution.definition}")
     print(f"  Author: {solution.author}")
     print(f"  Language: {language}")
+    print(f"  Entry point: {entry_point}")
 
     return output_path
 
