@@ -97,6 +97,37 @@ def _gdn_step(
     return output.squeeze(1).reshape_as(v_t), new_state
 
 
+def _gdn_step_decode(
+    q_t: torch.Tensor,
+    k_t: torch.Tensor,
+    v_t: torch.Tensor,
+    state_hkv: torch.Tensor,
+    g_t: torch.Tensor,
+    beta_t: torch.Tensor,
+    scale: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    old_state = g_t.unsqueeze(-1).unsqueeze(-1) * state_hkv
+    flat_state = old_state.reshape(-1, HEAD_SIZE, HEAD_SIZE)
+    flat_k = k_t.reshape(-1, HEAD_SIZE)
+    flat_q = q_t.reshape(-1, HEAD_SIZE)
+
+    # Decode only: reuse the old-state read for both k @ state and q @ state,
+    # then apply the rank-1 update analytically in the output space.
+    qk_state = torch.stack((flat_k, flat_q), dim=1)
+    kv_proj = torch.bmm(qk_state, flat_state)
+    old_v = kv_proj[:, 0, :].reshape_as(v_t)
+    q_old = kv_proj[:, 1, :].reshape_as(v_t)
+    delta_v = beta_t.unsqueeze(-1) * (v_t - old_v)
+    new_state = torch.baddbmm(
+        flat_state,
+        flat_k.unsqueeze(-1),
+        delta_v.reshape(-1, 1, HEAD_SIZE),
+    ).reshape_as(old_state)
+    qk = (flat_q * flat_k).sum(dim=-1, keepdim=True).reshape(*v_t.shape[:-1], 1)
+    output = scale * (q_old + qk * delta_v)
+    return output, new_state
+
+
 def gdn_decode_kernel(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -119,7 +150,7 @@ def gdn_decode_kernel(
     v_f = v.squeeze(1).float()
     g, beta = _compute_gate_and_beta(A_log, a, dt_bias, b)
     state_hkv = _init_state_hkv(state, batch_size, q.device)
-    output, new_state_hkv = _gdn_step(
+    output, new_state_hkv = _gdn_step_decode(
         q_exp,
         k_exp,
         v_f,
