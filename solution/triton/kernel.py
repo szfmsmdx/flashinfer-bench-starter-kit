@@ -82,11 +82,19 @@ def _gdn_step(
     scale: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     old_state = g_t.unsqueeze(-1).unsqueeze(-1) * state_hkv
-    old_v = torch.matmul(k_t.unsqueeze(-2), old_state).squeeze(-2)
+    flat_state = old_state.reshape(-1, HEAD_SIZE, HEAD_SIZE)
+    flat_k = k_t.reshape(-1, HEAD_SIZE)
+    flat_q = q_t.reshape(-1, HEAD_SIZE)
+
+    old_v = torch.bmm(flat_k.unsqueeze(1), flat_state).squeeze(1).reshape_as(v_t)
     delta_v = beta_t.unsqueeze(-1) * (v_t - old_v)
-    new_state = old_state + k_t.unsqueeze(-1) * delta_v.unsqueeze(-2)
-    output = scale * torch.matmul(q_t.unsqueeze(-2), new_state).squeeze(-2)
-    return output, new_state
+    new_state = torch.baddbmm(
+        flat_state,
+        flat_k.unsqueeze(-1),
+        delta_v.reshape(-1, 1, HEAD_SIZE),
+    ).reshape_as(old_state)
+    output = scale * torch.bmm(flat_q.unsqueeze(1), new_state.reshape(-1, HEAD_SIZE, HEAD_SIZE))
+    return output.squeeze(1).reshape_as(v_t), new_state
 
 
 def gdn_decode_kernel(
@@ -148,6 +156,9 @@ def gdn_prefill_kernel(
 
     lengths = (cu_seqlens[1:] - cu_seqlens[:-1]).to(dtype=torch.int64)
     max_seq_len = int(lengths.max().item()) if num_seqs > 0 else 0
+    order = torch.argsort(lengths, descending=True)
+    lengths_sorted = lengths.index_select(0, order)
+    state_hkv = state_hkv.index_select(0, order)
 
     padded_q = torch.zeros(num_seqs, max_seq_len, NUM_V_HEADS, HEAD_SIZE, device=q.device, dtype=torch.float32)
     padded_k = torch.zeros_like(padded_q)
@@ -156,45 +167,50 @@ def gdn_prefill_kernel(
     padded_beta = torch.zeros_like(padded_g)
 
     cu_list = cu_seqlens.to(dtype=torch.int64).cpu().tolist()
-    for seq_idx in range(num_seqs):
+    order_list = order.cpu().tolist()
+    lengths_sorted_list = lengths_sorted.cpu().tolist()
+    for sorted_idx, seq_idx in enumerate(order_list):
         start = cu_list[seq_idx]
         end = cu_list[seq_idx + 1]
         seq_len = end - start
         if seq_len <= 0:
             continue
-        padded_q[seq_idx, :seq_len] = q_exp[start:end]
-        padded_k[seq_idx, :seq_len] = k_exp[start:end]
-        padded_v[seq_idx, :seq_len] = v_f[start:end]
-        padded_g[seq_idx, :seq_len] = g[start:end]
-        padded_beta[seq_idx, :seq_len] = beta[start:end]
+        padded_q[sorted_idx, :seq_len] = q_exp[start:end]
+        padded_k[sorted_idx, :seq_len] = k_exp[start:end]
+        padded_v[sorted_idx, :seq_len] = v_f[start:end]
+        padded_g[sorted_idx, :seq_len] = g[start:end]
+        padded_beta[sorted_idx, :seq_len] = beta[start:end]
 
-    output_padded = torch.zeros_like(padded_v)
+    output_sorted = torch.zeros_like(padded_v)
+    active_count = num_seqs
     for t in range(max_seq_len):
-        active = lengths > t
-        if not bool(active.any().item()):
-            continue
+        while active_count > 0 and lengths_sorted_list[active_count - 1] <= t:
+            active_count -= 1
+        if active_count == 0:
+            break
         output_t, new_state = _gdn_step(
-            padded_q[active, t],
-            padded_k[active, t],
-            padded_v[active, t],
-            state_hkv[active],
-            padded_g[active, t],
-            padded_beta[active, t],
+            padded_q[:active_count, t],
+            padded_k[:active_count, t],
+            padded_v[:active_count, t],
+            state_hkv[:active_count],
+            padded_g[:active_count, t],
+            padded_beta[:active_count, t],
             scale_value,
         )
-        output_padded[active, t] = output_t
-        state_hkv[active] = new_state
+        output_sorted[:active_count, t] = output_t
+        state_hkv[:active_count] = new_state
 
     output = torch.empty(total_seq_len, NUM_V_HEADS, HEAD_SIZE, device=q.device, dtype=torch.float32)
-    for seq_idx in range(num_seqs):
+    final_state = torch.empty(num_seqs, NUM_V_HEADS, HEAD_SIZE, HEAD_SIZE, device=q.device, dtype=torch.float32)
+    for sorted_idx, seq_idx in enumerate(order_list):
         start = cu_list[seq_idx]
         end = cu_list[seq_idx + 1]
         seq_len = end - start
-        if seq_len <= 0:
-            continue
-        output[start:end] = output_padded[seq_idx, :seq_len]
+        if seq_len > 0:
+            output[start:end] = output_sorted[sorted_idx, :seq_len]
+        final_state[seq_idx] = state_hkv[sorted_idx].transpose(-1, -2)
 
-    return output.to(q.dtype), state_hkv.transpose(-1, -2).contiguous()
+    return output.to(q.dtype), final_state.contiguous()
 
 
 # Default alias for ad-hoc imports.
