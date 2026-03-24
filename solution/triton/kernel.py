@@ -1,21 +1,28 @@
 """FlashInfer GDN solution entrypoints.
 
-This file intentionally mirrors the validated PyTorch baselines in
-`cuda-evolve-oss/kernels/` so the starter kit can package and benchmark the
-same semantics. The current default in `config.toml` points to
-`gdn_decode_kernel`. To benchmark prefill instead, switch:
-
-- `solution.definition` -> `gdn_prefill_qk4_v8_d128_k_last`
-- `build.entry_point` -> `kernel.py::gdn_prefill_kernel`
-- keep `destination_passing_style = false`
+This file mirrors the validated `cuda-evolve-oss` Triton-first strategy.
+Both `gdn_decode_kernel` and `gdn_prefill_kernel` prefer Triton when available.
+Set `FLASHINFER_GDN_DISABLE_TRITON=1` to force torch fallback everywhere.
 """
 
 from __future__ import annotations
 
 import math
+import os
 
 import torch
 import torch.nn.functional as F
+
+try:
+    import triton
+    import triton.language as tl
+
+    _TRITON_AVAILABLE = True
+except ImportError:
+    triton = None
+    tl = None
+    _TRITON_AVAILABLE = False
+
 
 NUM_Q_HEADS = 4
 NUM_K_HEADS = 4
@@ -23,6 +30,82 @@ NUM_V_HEADS = 8
 HEAD_SIZE = 128
 Q_GROUP_SIZE = NUM_V_HEADS // NUM_Q_HEADS
 K_GROUP_SIZE = NUM_V_HEADS // NUM_K_HEADS
+_TRITON_BLOCK = 32
+
+_DISABLE_TRITON = os.environ.get("FLASHINFER_GDN_DISABLE_TRITON", "").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+
+
+if _TRITON_AVAILABLE:
+
+    @triton.jit
+    def _gdn_step_fused_kernel(
+        q_ptr,
+        k_ptr,
+        v_ptr,
+        state_ptr,
+        g_ptr,
+        beta_ptr,
+        scale,
+        out_ptr,
+        new_state_ptr,
+        q_stride,
+        v_stride,
+        state_stride,
+        out_stride,
+        new_state_stride,
+        HEAD_SIZE_CONST: tl.constexpr,
+        BLOCK: tl.constexpr,
+    ):
+        pid_item = tl.program_id(axis=0)
+        g = tl.load(g_ptr + pid_item)
+        beta = tl.load(beta_ptr + pid_item)
+
+        q_item_ptr = q_ptr + pid_item * q_stride
+        k_item_ptr = k_ptr + pid_item * q_stride
+        v_item_ptr = v_ptr + pid_item * v_stride
+        state_item_ptr = state_ptr + pid_item * state_stride
+        out_item_ptr = out_ptr + pid_item * out_stride
+        new_state_item_ptr = new_state_ptr + pid_item * new_state_stride
+
+        qk = tl.zeros([], dtype=tl.float32)
+        for offset in tl.static_range(0, HEAD_SIZE_CONST, BLOCK):
+            idx = offset + tl.arange(0, BLOCK)
+            q_block = tl.load(q_item_ptr + idx).to(tl.float32)
+            k_block = tl.load(k_item_ptr + idx).to(tl.float32)
+            qk += tl.sum(q_block * k_block, axis=0)
+
+        for col_offset in tl.static_range(0, HEAD_SIZE_CONST, BLOCK):
+            cols = col_offset + tl.arange(0, BLOCK)
+            old_v = tl.zeros([BLOCK], dtype=tl.float32)
+            q_old = tl.zeros([BLOCK], dtype=tl.float32)
+
+            for row_offset in tl.static_range(0, HEAD_SIZE_CONST, BLOCK):
+                rows = row_offset + tl.arange(0, BLOCK)
+                state_ptrs = state_item_ptr + rows[:, None] * HEAD_SIZE_CONST + cols[None, :]
+                old_state = tl.load(state_ptrs).to(tl.float32) * g
+                q_block = tl.load(q_item_ptr + rows).to(tl.float32)
+                k_block = tl.load(k_item_ptr + rows).to(tl.float32)
+                old_v += tl.sum(old_state * k_block[:, None], axis=0)
+                q_old += tl.sum(old_state * q_block[:, None], axis=0)
+
+            v_block = tl.load(v_item_ptr + cols).to(tl.float32)
+            delta_v = (v_block - old_v) * beta
+            out_block = scale * (q_old + qk * delta_v)
+            tl.store(out_item_ptr + cols, out_block)
+
+            for row_offset in tl.static_range(0, HEAD_SIZE_CONST, BLOCK):
+                rows = row_offset + tl.arange(0, BLOCK)
+                state_ptrs = state_item_ptr + rows[:, None] * HEAD_SIZE_CONST + cols[None, :]
+                old_state = tl.load(state_ptrs).to(tl.float32) * g
+                k_block = tl.load(k_item_ptr + rows).to(tl.float32)
+                new_state = old_state + k_block[:, None] * delta_v[None, :]
+                new_state_ptrs = new_state_item_ptr + rows[:, None] * HEAD_SIZE_CONST + cols[None, :]
+                tl.store(new_state_ptrs, new_state)
 
 
 def _normalize_scale(scale: float | torch.Tensor | None) -> float:
@@ -72,7 +155,18 @@ def _init_state_hkv(state: torch.Tensor | None, batch_size: int, device: torch.d
     return state.float().transpose(-1, -2).contiguous()
 
 
-def _gdn_step(
+def _can_use_triton(*tensors: torch.Tensor) -> bool:
+    if _DISABLE_TRITON or not _TRITON_AVAILABLE:
+        return False
+    if not tensors:
+        return False
+    device = tensors[0].device
+    if device.type != "cuda":
+        return False
+    return all(t.is_cuda and t.device == device for t in tensors)
+
+
+def _gdn_step_torch(
     q_t: torch.Tensor,
     k_t: torch.Tensor,
     v_t: torch.Tensor,
@@ -97,7 +191,7 @@ def _gdn_step(
     return output.squeeze(1).reshape_as(v_t), new_state
 
 
-def _gdn_step_decode(
+def _gdn_step_decode_torch(
     q_t: torch.Tensor,
     k_t: torch.Tensor,
     v_t: torch.Tensor,
@@ -111,8 +205,6 @@ def _gdn_step_decode(
     flat_k = k_t.reshape(-1, HEAD_SIZE)
     flat_q = q_t.reshape(-1, HEAD_SIZE)
 
-    # Decode only: reuse the old-state read for both k @ state and q @ state,
-    # then apply the rank-1 update analytically in the output space.
     qk_state = torch.stack((flat_k, flat_q), dim=1)
     kv_proj = torch.bmm(qk_state, flat_state)
     old_v = kv_proj[:, 0, :].reshape_as(v_t)
@@ -126,6 +218,77 @@ def _gdn_step_decode(
     qk = (flat_q * flat_k).sum(dim=-1, keepdim=True).reshape(*v_t.shape[:-1], 1)
     output = scale * (q_old + qk * delta_v)
     return output, new_state
+
+
+def _gdn_step_triton(
+    q_t: torch.Tensor,
+    k_t: torch.Tensor,
+    v_t: torch.Tensor,
+    state_hkv: torch.Tensor,
+    g_t: torch.Tensor,
+    beta_t: torch.Tensor,
+    scale: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    q_flat = q_t.reshape(-1, HEAD_SIZE).contiguous()
+    k_flat = k_t.reshape(-1, HEAD_SIZE).contiguous()
+    v_flat = v_t.reshape(-1, HEAD_SIZE).contiguous()
+    state_flat = state_hkv.reshape(-1, HEAD_SIZE, HEAD_SIZE).contiguous()
+    g_flat = g_t.reshape(-1).contiguous()
+    beta_flat = beta_t.reshape(-1).contiguous()
+
+    output = torch.empty_like(v_flat)
+    new_state = torch.empty_like(state_flat)
+
+    _gdn_step_fused_kernel[(q_flat.shape[0],)](
+        q_flat,
+        k_flat,
+        v_flat,
+        state_flat,
+        g_flat,
+        beta_flat,
+        scale,
+        output,
+        new_state,
+        q_flat.stride(0),
+        v_flat.stride(0),
+        state_flat.stride(0),
+        output.stride(0),
+        new_state.stride(0),
+        HEAD_SIZE_CONST=HEAD_SIZE,
+        BLOCK=_TRITON_BLOCK,
+        num_warps=8,
+        num_stages=2,
+    )
+
+    return output.reshape_as(v_t), new_state.reshape_as(state_hkv)
+
+
+def _gdn_step(
+    q_t: torch.Tensor,
+    k_t: torch.Tensor,
+    v_t: torch.Tensor,
+    state_hkv: torch.Tensor,
+    g_t: torch.Tensor,
+    beta_t: torch.Tensor,
+    scale: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if _can_use_triton(q_t, k_t, v_t, state_hkv, g_t, beta_t):
+        return _gdn_step_triton(q_t, k_t, v_t, state_hkv, g_t, beta_t, scale)
+    return _gdn_step_torch(q_t, k_t, v_t, state_hkv, g_t, beta_t, scale)
+
+
+def _gdn_step_decode(
+    q_t: torch.Tensor,
+    k_t: torch.Tensor,
+    v_t: torch.Tensor,
+    state_hkv: torch.Tensor,
+    g_t: torch.Tensor,
+    beta_t: torch.Tensor,
+    scale: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if _can_use_triton(q_t, k_t, v_t, state_hkv, g_t, beta_t):
+        return _gdn_step_triton(q_t, k_t, v_t, state_hkv, g_t, beta_t, scale)
+    return _gdn_step_decode_torch(q_t, k_t, v_t, state_hkv, g_t, beta_t, scale)
 
 
 def gdn_decode_kernel(
