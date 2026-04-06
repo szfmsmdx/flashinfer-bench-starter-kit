@@ -57,8 +57,9 @@ def pack_solution(output_path: Path = None) -> Path:
         "language": language,
         "target_hardware": ["cuda"],
         "entry_point": entry_point,
+        "destination_passing_style": build_config.get("destination_passing_style", True),
     }
-    for optional_key in ("dependencies", "destination_passing_style", "binding"):
+    for optional_key in ("dependencies", "binding"):
         if optional_key in build_config:
             spec_kwargs[optional_key] = build_config[optional_key]
 
