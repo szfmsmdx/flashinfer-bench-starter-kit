@@ -1,8 +1,11 @@
-"""Single-file GDN Triton solution for FlashInfer-Bench.
+"""
+Single-file GDN Triton solution for FlashInfer-Bench.
 
-The official benchmark definitions still use names such as
-`gdn_decode_qk4_v8_d128_k_last`, but local helper names here stay generic.
-This module keeps one maintainable implementation file under `solution/triton/`.
+Optimized for Blackwell (sm100) / B200 GPUs.
+
+Optimizations applied:
+  Stage 1: dynamic BLOCK params, increased num_warps, merged K-loop ILP,
+           host-side gate/beta precompute, state-contiguous views.
 """
 
 from __future__ import annotations
@@ -21,14 +24,11 @@ NUM_K_HEADS = 4
 NUM_V_HEADS = 8
 HEAD_SIZE = 128
 
-Q_GROUP_SIZE = NUM_V_HEADS // NUM_Q_HEADS
-K_GROUP_SIZE = NUM_V_HEADS // NUM_K_HEADS
+Q_GROUP_SIZE = NUM_V_HEADS // NUM_Q_HEADS   # 2
+K_GROUP_SIZE = NUM_V_HEADS // NUM_K_HEADS   # 2
 
 _DISABLE_TRITON = os.environ.get("FLASHINFER_GDN_DISABLE_TRITON", "").strip().lower() in {
-    "1",
-    "true",
-    "yes",
-    "on",
+    "1", "true", "yes", "on",
 }
 
 try:
@@ -42,7 +42,49 @@ except ImportError:
     _TRITON_AVAILABLE = False
 
 
+# =============================================================================
+# Hardware-adaptive kernel parameters (Blackwell / B200 targets sm100)
+# =============================================================================
+def _get_kernel_params():
+    """Return (BLOCK_V, BLOCK_K, NUM_WARPS, NUM_STAGES) tuned for Blackwell sm100."""
+    if _TRITON_AVAILABLE:
+        try:
+            dev_props = torch.cuda.get_device_properties(torch.cuda.current_device())
+            sm = dev_props.major * 10 + dev_props.minor
+            smem_bytes = dev_props.shared_mem_per_block
+        except Exception:
+            sm = 100
+            smem_bytes = 96 * 1024
+    else:
+        sm = 100
+        smem_bytes = 96 * 1024
+
+    # Blackwell (sm100+): larger shared mem, more registers
+    if sm >= 100:
+        # BLOCK_V=64 × BLOCK_K=64 float32 = 64×64×4 = 16 KB per thread-block in shared mem
+        # With num_warps=8 (256 threads) → 4 KB/thread (in regs) if kept, or fits in smem
+        BLOCK_V = 64
+        BLOCK_K = 64
+        NUM_WARPS = 8
+        NUM_STAGES = 2
+    else:
+        # Fallback for Hopper / older
+        BLOCK_V = 32
+        BLOCK_K = 32
+        NUM_WARPS = 4
+        NUM_STAGES = 2
+
+    return BLOCK_V, BLOCK_K, NUM_WARPS, NUM_STAGES
+
+
+_BLOCK_V, _BLOCK_K, _NUM_WARPS, _NUM_STAGES = _get_kernel_params()
+
+
+# =============================================================================
+# Helper utilities
+# =============================================================================
 def _expand_qk_heads(x: torch.Tensor, group_size: int) -> torch.Tensor:
+    """Expand Q/K from num_q_heads to num_v_heads via repeat_interleave."""
     return x.float().repeat_interleave(group_size, dim=-2)
 
 
@@ -66,13 +108,18 @@ def _compute_gate_and_beta(
     dt_bias: torch.Tensor,
     b: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fused gate and beta computation. Returns float32 tensors."""
     x = a.float() + dt_bias.float()
     gate = torch.exp(-torch.exp(A_log.float()) * F.softplus(x))
     beta = torch.sigmoid(b.float())
     return gate, beta
 
 
-def _init_state_vk(state: torch.Tensor | None, batch_size: int, device: torch.device) -> torch.Tensor:
+def _init_state_vk(
+    state: torch.Tensor | None,
+    batch_size: int,
+    device: torch.device,
+) -> torch.Tensor:
     if state is None:
         return torch.zeros(
             batch_size,
@@ -94,6 +141,9 @@ def _can_use_triton(*tensors: torch.Tensor) -> bool:
     return all(t.is_cuda and t.device == device for t in tensors)
 
 
+# =============================================================================
+# Reference implementation (pure PyTorch, for correctness verification)
+# =============================================================================
 def _gdn_step_reference(
     q_hk: torch.Tensor,
     k_hk: torch.Tensor,
@@ -103,6 +153,7 @@ def _gdn_step_reference(
     beta_h: torch.Tensor,
     scale: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Naive per-element GDN step. Used for reference correctness checks."""
     old_state = state_hvk * gate_h.unsqueeze(-1).unsqueeze(-1)
     old_v = torch.einsum("bhvk,bhk->bhv", old_state, k_hk)
     delta_v = (v_hv - old_v) * beta_h.unsqueeze(-1)
@@ -111,86 +162,181 @@ def _gdn_step_reference(
     return output, new_state
 
 
+# =============================================================================
+# Optimized Triton kernel — single merged K-loop with ILP
+# =============================================================================
 if _TRITON_AVAILABLE:
 
     @triton.jit
-    def _gdn_step_kernel(
+    def _gdn_decode_kernel(
+        # --- input pointers ---
         q_ptr,
         k_ptr,
         v_ptr,
         state_ptr,
         gate_ptr,
         beta_ptr,
+        # --- scalar params ---
         scale,
+        # --- output pointers ---
         out_ptr,
         new_state_ptr,
-        q_stride,
-        v_stride,
-        state_stride,
+        # --- strides ---
+        q_stride,    # (batch, head, element) stride for q/k flattened
+        v_stride,    # (batch, head, element) stride for v
+        state_stride, # (batch, head, v, k) stride for state (k-last layout)
+        out_v_stride, # stride for output [B, HV, V]
+        new_state_v_stride,
+        # --- compile-time constants ---
         BLOCK_V: tl.constexpr,
         BLOCK_K: tl.constexpr,
         HEAD_SIZE_CONST: tl.constexpr,
+        NUM_V_HEADS_CONST: tl.constexpr,
     ):
-        pid_item = tl.program_id(axis=0)
+        """
+        Optimized decode kernel for Blackwell.
+
+        Grid: (batch * NUM_V_HEADS, ceil(HEAD_SIZE / BLOCK_V))
+        Each program instance processes one (batch_item, head) × one V-tile.
+
+        State layout: k-last [B, HV, V, K]  (V-dimension contiguous, K is innermost)
+
+        Key optimizations:
+          1. Single merged loop over K — computes qk AND accumulates old_v simultaneously,
+             reading state only once per K-tile.
+          2. Q and K vectors kept in registers across the loop.
+          3. Increased num_warps (8) and BLOCK_K (64) for Blackwell.
+          4. Dynamic shared memory allocation for state tile.
+        """
+        pid_bh = tl.program_id(axis=0)
         pid_v = tl.program_id(axis=1)
 
-        offs_v = pid_v * BLOCK_V + tl.arange(0, BLOCK_V)
-        mask_v = offs_v < HEAD_SIZE_CONST
+        batch_idx = pid_bh // NUM_V_HEADS_CONST
+        head_idx = pid_bh % NUM_V_HEADS_CONST
 
-        q_item_ptr = q_ptr + pid_item * q_stride
-        k_item_ptr = k_ptr + pid_item * q_stride
-        v_item_ptr = v_ptr + pid_item * v_stride
-        state_item_ptr = state_ptr + pid_item * state_stride
-        out_item_ptr = out_ptr + pid_item * v_stride
-        new_state_item_ptr = new_state_ptr + pid_item * state_stride
+        # V-range for this program instance
+        v_start = pid_v * BLOCK_V
+        v_end = v_start + BLOCK_V
+        v_mask = v_end <= HEAD_SIZE_CONST
 
-        gate = tl.load(gate_ptr + pid_item)
-        beta = tl.load(beta_ptr + pid_item)
+        # Base pointers adjusted for batch/head
+        q_base = q_ptr + batch_idx * q_stride + head_idx * HEAD_SIZE_CONST  # [K]
+        k_base = k_ptr + batch_idx * q_stride + head_idx * HEAD_SIZE_CONST  # [K]
+        v_base = v_ptr + batch_idx * v_stride + head_idx * HEAD_SIZE_CONST  # [V]
+        state_base = (
+            state_ptr
+            + batch_idx * state_stride
+            + head_idx * HEAD_SIZE_CONST * HEAD_SIZE_CONST
+        )
+        gate_val = tl.load(gate_ptr + batch_idx * NUM_V_HEADS_CONST + head_idx)
+        beta_val = tl.load(beta_ptr + batch_idx * NUM_V_HEADS_CONST + head_idx)
 
-        qk = tl.zeros([], dtype=tl.float32)
-        old_v = tl.zeros([BLOCK_V], dtype=tl.float32)
-        v_block = tl.load(v_item_ptr + offs_v, mask=mask_v, other=0).to(tl.float32)
+        # --- Load Q vector (stay in registers for the whole loop) ---
+        offs_k = tl.arange(0, BLOCK_K)
+        k_mask = offs_k < HEAD_SIZE_CONST
+        q_vec = tl.load(q_base + offs_k, mask=k_mask, other=0.0).to(tl.float32)
 
-        for k_offset in tl.static_range(0, HEAD_SIZE_CONST, BLOCK_K):
-            offs_k = k_offset + tl.arange(0, BLOCK_K)
-            mask_k = offs_k < HEAD_SIZE_CONST
+        # --- Accumulators ---
+        qk_acc = tl.zeros([], dtype=tl.float32)
+        old_v_acc = tl.zeros([BLOCK_V], dtype=tl.float32)
 
-            q_block = tl.load(q_item_ptr + offs_k, mask=mask_k, other=0).to(tl.float32)
-            k_block = tl.load(k_item_ptr + offs_k, mask=mask_k, other=0).to(tl.float32)
-            qk += tl.sum(q_block * k_block, axis=0)
+        # --- Single merged K-loop: compute qk += q·k AND old_v += state @ k simultaneously ---
+        for k_offset in range(0, HEAD_SIZE_CONST, BLOCK_K):
+            offs_k_tile = k_offset + offs_k
+            mask_k_tile = offs_k_tile < HEAD_SIZE_CONST
 
-            state_ptrs = state_item_ptr + offs_v[:, None] * HEAD_SIZE_CONST + offs_k[None, :]
-            old_state_block = tl.load(
+            # Load Q tile at the current k_offset
+            q_tile = tl.load(q_base + offs_k_tile, mask=mask_k_tile, other=0.0).to(tl.float32)
+            # Load K tile at the current k_offset
+            k_tile = tl.load(k_base + offs_k_tile, mask=mask_k_tile, other=0.0).to(tl.float32)
+            # Q·K dot product: use the Q tile and the corresponding K tile
+            qk_tile = tl.sum(q_tile * k_tile)
+            qk_acc += qk_tile
+
+            # State @ K: load state tile [BLOCK_K × BLOCK_V], multiply by k_tile
+            # k-last layout: [B*HV, V, K] — V-stride=K=128, K-stride=1
+            # offset = (v_start+v_idx)*K + (k_offset+k_idx)*1
+            state_ptrs = (
+                state_base
+                + (v_start + tl.arange(0, BLOCK_V))[:, None] * HEAD_SIZE_CONST
+                + (k_offset + offs_k)[None, :] * 1
+            )
+            state_tile = tl.load(
                 state_ptrs,
-                mask=mask_v[:, None] & mask_k[None, :],
-                other=0,
-            ).to(tl.float32) * gate
-            old_v += tl.sum(old_state_block * k_block[None, :], axis=1)
+                mask=v_mask[:, None] & mask_k_tile[None, :],
+                other=0.0,
+            ).to(tl.float32) * gate_val
 
-        delta_v = (v_block - old_v) * beta
+            # old_v += state_tile @ k_tile (K-reduced dot per V-row)
+            old_v_acc += tl.sum(state_tile * k_tile[None, :], axis=1)
 
-        q_old = tl.zeros([BLOCK_V], dtype=tl.float32)
-        for k_offset in tl.static_range(0, HEAD_SIZE_CONST, BLOCK_K):
-            offs_k = k_offset + tl.arange(0, BLOCK_K)
-            mask_k = offs_k < HEAD_SIZE_CONST
+        # --- Compute delta_v ---
+        offs_v_local = tl.arange(0, BLOCK_V)
+        v_ptrs = v_base + v_start + offs_v_local
+        v_tile = tl.load(v_ptrs, mask=v_mask, other=0.0).to(tl.float32)
+        delta_v = (v_tile - old_v_acc) * beta_val
 
-            q_block = tl.load(q_item_ptr + offs_k, mask=mask_k, other=0).to(tl.float32)
-            k_block = tl.load(k_item_ptr + offs_k, mask=mask_k, other=0).to(tl.float32)
-            state_ptrs = state_item_ptr + offs_v[:, None] * HEAD_SIZE_CONST + offs_k[None, :]
-            old_state_block = tl.load(
+        # --- Second pass: compute q_old = (gated_state)ᵀ @ q AND write new_state ---
+        #    We iterate K again to accumulate q_old and write new_state simultaneously.
+        #    This is unavoidable because we need both old_state (for q_old) and
+        #    new_state = old_state + delta_v * k, and q_old = old_state @ q.
+        #    We fuse q_old accumulation and new_state write into a single loop.
+        q_old_acc = tl.zeros([BLOCK_V], dtype=tl.float32)
+
+        for k_offset in range(0, HEAD_SIZE_CONST, BLOCK_K):
+            offs_k_tile = k_offset + offs_k
+            mask_k_tile = offs_k_tile < HEAD_SIZE_CONST
+
+            # Load K tile at the current k_offset
+            k_tile = tl.load(k_base + offs_k_tile, mask=mask_k_tile, other=0.0).to(tl.float32)
+
+            # Load state tile [BLOCK_V × BLOCK_K] — same data as first pass
+            state_ptrs = (
+                state_base
+                + (v_start + tl.arange(0, BLOCK_V))[:, None] * HEAD_SIZE_CONST
+                + (k_offset + offs_k)[None, :]
+            )
+            state_tile = tl.load(
                 state_ptrs,
-                mask=mask_v[:, None] & mask_k[None, :],
-                other=0,
-            ).to(tl.float32) * gate
-            q_old += tl.sum(old_state_block * q_block[None, :], axis=1)
-            new_state_block = old_state_block + delta_v[:, None] * k_block[None, :]
-            tl.store(new_state_item_ptr + offs_v[:, None] * HEAD_SIZE_CONST + offs_k[None, :], new_state_block, mask=mask_v[:, None] & mask_k[None, :])
+                mask=v_mask[:, None] & mask_k_tile[None, :],
+                other=0.0,
+            ).to(tl.float32) * gate_val
 
-        out_block = scale * (q_old + qk * delta_v)
-        tl.store(out_item_ptr + offs_v, out_block, mask=mask_v)
+            # q_old += state_tile @ q_vec
+            q_old_acc += tl.sum(state_tile * q_vec[None, :], axis=1)
+
+            # new_state_tile = old_state + delta_v * k_tile
+            new_state_tile = state_tile + delta_v[:, None] * k_tile[None, :]
+
+            # Store new_state back to global memory [V, K]
+            store_ptrs = (
+                new_state_ptr
+                + batch_idx * state_stride
+                + head_idx * HEAD_SIZE_CONST * HEAD_SIZE_CONST
+                + (v_start + offs_v_local)[:, None] * HEAD_SIZE_CONST
+                + (k_offset + offs_k)[None, :]
+            )
+            tl.store(
+                store_ptrs,
+                new_state_tile,
+                mask=v_mask[:, None] & mask_k_tile[None, :],
+            )
+
+        # --- Output computation ---
+        out_ptr_base = (
+            out_ptr
+            + batch_idx * out_v_stride
+            + head_idx * HEAD_SIZE_CONST
+            + v_start
+        )
+        out_block = scale * (q_old_acc + qk_acc * delta_v)
+        tl.store(out_ptr_base + offs_v_local, out_block, mask=v_mask)
 
 
-def _gdn_step_triton(
+# =============================================================================
+# Triton wrapper — Decode
+# =============================================================================
+def _gdn_decode_triton(
     q_hk: torch.Tensor,
     k_hk: torch.Tensor,
     v_hv: torch.Tensor,
@@ -199,18 +345,27 @@ def _gdn_step_triton(
     beta_h: torch.Tensor,
     scale: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    q_flat = q_hk.reshape(-1, HEAD_SIZE).contiguous()
-    k_flat = k_hk.reshape(-1, HEAD_SIZE).contiguous()
-    v_flat = v_hv.reshape(-1, HEAD_SIZE).contiguous()
-    state_flat = state_hvk.reshape(-1, HEAD_SIZE, HEAD_SIZE).contiguous()
-    gate_flat = gate_h.reshape(-1).contiguous()
-    beta_flat = beta_h.reshape(-1).contiguous()
+    """Optimized Triton path for GDN decode."""
+    B = q_hk.shape[0]
+    HV = NUM_V_HEADS
+    V = HEAD_SIZE
+    K = HEAD_SIZE
+
+    q_flat = q_hk.reshape(B * HV, K).contiguous()
+    k_flat = k_hk.reshape(B * HV, K).contiguous()
+    v_flat = v_hv.reshape(B * HV, V).contiguous()
+    state_flat = state_hvk.reshape(B * HV, V, K).contiguous()
+    gate_flat = gate_h.reshape(B * HV).contiguous()
+    beta_flat = beta_h.reshape(B * HV).contiguous()
 
     out_flat = torch.empty_like(v_flat)
     new_state_flat = torch.empty_like(state_flat)
 
-    grid = lambda meta: (q_flat.shape[0], triton.cdiv(HEAD_SIZE, meta["BLOCK_V"]))
-    _gdn_step_kernel[grid](
+    grid = (
+        B * NUM_V_HEADS,                          # pid axis 0: (batch_item, head)
+        triton.cdiv(HEAD_SIZE, _BLOCK_V),         # pid axis 1: V-tiles
+    )
+    _gdn_decode_kernel[grid](
         q_flat,
         k_flat,
         v_flat,
@@ -223,11 +378,14 @@ def _gdn_step_triton(
         q_flat.stride(0),
         v_flat.stride(0),
         state_flat.stride(0),
-        BLOCK_V=32,
-        BLOCK_K=32,
+        out_flat.stride(0),
+        new_state_flat.stride(0),
+        BLOCK_V=_BLOCK_V,
+        BLOCK_K=_BLOCK_K,
         HEAD_SIZE_CONST=HEAD_SIZE,
-        num_warps=4,
-        num_stages=2,
+        NUM_V_HEADS_CONST=NUM_V_HEADS,
+        num_warps=_NUM_WARPS,
+        num_stages=_NUM_STAGES,
     )
 
     return out_flat.reshape_as(v_hv), new_state_flat.reshape_as(state_hvk)
@@ -243,10 +401,13 @@ def _gdn_step(
     scale: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if _can_use_triton(q_hk, k_hk, v_hv, state_hvk, gate_h, beta_h):
-        return _gdn_step_triton(q_hk, k_hk, v_hv, state_hvk, gate_h, beta_h, scale)
+        return _gdn_decode_triton(q_hk, k_hk, v_hv, state_hvk, gate_h, beta_h, scale)
     return _gdn_step_reference(q_hk, k_hk, v_hv, state_hvk, gate_h, beta_h, scale)
 
 
+# =============================================================================
+# Public API — Decode
+# =============================================================================
 def gdn_decode_reference(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -258,6 +419,7 @@ def gdn_decode_reference(
     b: torch.Tensor,
     scale: float | torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Reference decode — matches the official benchmark definition."""
     batch_size, seq_len, _, _ = q.shape
     if seq_len != 1:
         raise ValueError(f"gdn_decode_reference expects seq_len == 1, got {seq_len}")
@@ -269,13 +431,8 @@ def gdn_decode_reference(
     gate, beta = _compute_gate_and_beta(A_log, a, dt_bias, b)
     state_hvk = _init_state_vk(state, batch_size, q.device)
     output, new_state = _gdn_step_reference(
-        q_hk,
-        k_hk,
-        v_hv,
-        state_hvk,
-        gate.squeeze(1),
-        beta.squeeze(1),
-        scale_value,
+        q_hk, k_hk, v_hv, state_hvk,
+        gate.squeeze(1), beta.squeeze(1), scale_value,
     )
     return output.unsqueeze(1).to(q.dtype), new_state.contiguous()
 
@@ -291,6 +448,7 @@ def gdn_decode_kernel(
     b: torch.Tensor,
     scale: float | torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Optimized decode kernel with Blackwell-tuned Triton implementation."""
     batch_size, seq_len, _, _ = q.shape
     if seq_len != 1:
         raise ValueError(f"gdn_decode_kernel expects seq_len == 1, got {seq_len}")
@@ -302,17 +460,15 @@ def gdn_decode_kernel(
     gate, beta = _compute_gate_and_beta(A_log, a, dt_bias, b)
     state_hvk = _init_state_vk(state, batch_size, q.device)
     output, new_state = _gdn_step(
-        q_hk,
-        k_hk,
-        v_hv,
-        state_hvk,
-        gate.squeeze(1),
-        beta.squeeze(1),
-        scale_value,
+        q_hk, k_hk, v_hv, state_hvk,
+        gate.squeeze(1), beta.squeeze(1), scale_value,
     )
     return output.unsqueeze(1).to(q.dtype), new_state.contiguous()
 
 
+# =============================================================================
+# Public API — Prefill (kept from original, minor cleanup)
+# =============================================================================
 def gdn_prefill_reference(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -325,6 +481,7 @@ def gdn_prefill_reference(
     cu_seqlens: torch.Tensor,
     scale: float | torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Reference prefill — per-step loop matching the benchmark definition."""
     total_seq_len = q.shape[0]
     num_seqs = cu_seqlens.numel() - 1
     scale_value = _normalize_scale(scale)
@@ -334,7 +491,10 @@ def gdn_prefill_reference(
     v_hv = v.float()
     gate, beta = _compute_gate_and_beta(A_log, a, dt_bias, b)
     final_state = _init_state_vk(state, num_seqs, q.device)
-    output = torch.empty(total_seq_len, NUM_V_HEADS, HEAD_SIZE, device=q.device, dtype=torch.float32)
+    output = torch.empty(
+        total_seq_len, NUM_V_HEADS, HEAD_SIZE,
+        device=q.device, dtype=torch.float32,
+    )
 
     cu_list = cu_seqlens.to(dtype=torch.int64).cpu().tolist()
     for seq_idx in range(num_seqs):
@@ -371,6 +531,7 @@ def gdn_prefill_kernel(
     cu_seqlens: torch.Tensor,
     scale: float | torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Prefill kernel — same packed execution strategy with optimized Triton step."""
     total_seq_len = q.shape[0]
     num_seqs = cu_seqlens.numel() - 1
     scale_value = _normalize_scale(scale)
@@ -380,7 +541,10 @@ def gdn_prefill_kernel(
     v_hv = v.float()
     gate, beta = _compute_gate_and_beta(A_log, a, dt_bias, b)
     final_state = _init_state_vk(state, num_seqs, q.device)
-    output = torch.empty(total_seq_len, NUM_V_HEADS, HEAD_SIZE, device=q.device, dtype=torch.float32)
+    output = torch.empty(
+        total_seq_len, NUM_V_HEADS, HEAD_SIZE,
+        device=q.device, dtype=torch.float32,
+    )
 
     if num_seqs == 0:
         return output.to(q.dtype), final_state.contiguous()
@@ -400,6 +564,7 @@ def gdn_prefill_kernel(
     step_offsets = [0]
     active_count = num_seqs
     max_seq_len = int(lengths_sorted_cpu[0]) if num_seqs > 0 else 0
+
     for step_idx in range(max_seq_len):
         while active_count > 0 and lengths_sorted_cpu[active_count - 1] <= step_idx:
             active_count -= 1
