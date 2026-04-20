@@ -13,7 +13,7 @@ PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from flashinfer_bench import Benchmark, BenchmarkConfig, Solution, TraceSet
-from scripts.pack_solution import pack_solution
+from scripts.pack_solution import discover_solution_dirs, pack_solution
 
 
 def get_trace_set_path() -> str:
@@ -98,10 +98,10 @@ def print_results(results: dict):
             print()
 
 
-def main():
-    """Pack solution and run benchmark."""
-    print("Packing solution from source files...")
-    solution_path = pack_solution()
+def run_solution_dir(solution_dir: Path):
+    """Pack one solution directory and run benchmark."""
+    print(f"Packing solution from source files: {solution_dir}")
+    solution_path = pack_solution(solution_dir)
 
     print("\nLoading solution...")
     solution = Solution.model_validate_json(solution_path.read_text())
@@ -115,6 +115,22 @@ def main():
         return
 
     print_results(results)
+
+
+def main():
+    """Pack solution(s) and run benchmark."""
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Run local FlashInfer-Bench workloads")
+    parser.add_argument(
+        "paths",
+        nargs="*",
+        help="Solution directories to run (default: root config or all top-level configs)",
+    )
+    args = parser.parse_args()
+
+    for solution_dir in discover_solution_dirs(args.paths):
+        run_solution_dir(solution_dir)
 
 
 if __name__ == "__main__":

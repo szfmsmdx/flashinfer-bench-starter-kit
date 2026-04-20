@@ -2,6 +2,12 @@
 
 Create high-performance GPU kernels for state-of-the-art LLM architectures on NVIDIA Blackwell GPUs with humans and/or AI agents.
 
+> This repository is prepared for Track C / GDN with two top-level submission
+> directories: `gdn_decode_qk4_v8_d128_k_last/` and
+> `gdn_prefill_qk4_v8_d128_k_last/`. See [SUBMISSION.md](SUBMISSION.md) for the
+> exact layout and submission commands. There is intentionally no root-level
+> `config.toml`, so the evaluator only picks up the two GDN definitions.
+
 ---
 
 <p align="center">

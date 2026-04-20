@@ -103,22 +103,24 @@ def print_results(results: dict):
 
 
 @app.local_entrypoint()
-def main():
-    """Pack solution and run benchmark on Modal."""
-    from scripts.pack_solution import pack_solution
+def main(path: str = ""):
+    """Pack solution(s) and run benchmark on Modal."""
+    from scripts.pack_solution import discover_solution_dirs, pack_solution
 
-    print("Packing solution from source files...")
-    solution_path = pack_solution()
+    paths = [path] if path else []
+    for solution_dir in discover_solution_dirs(paths):
+        print(f"Packing solution from source files: {solution_dir}")
+        solution_path = pack_solution(solution_dir)
 
-    print("\nLoading solution...")
-    solution = Solution.model_validate_json(solution_path.read_text())
-    print(f"Loaded: {solution.name} ({solution.definition})")
+        print("\nLoading solution...")
+        solution = Solution.model_validate_json(solution_path.read_text())
+        print(f"Loaded: {solution.name} ({solution.definition})")
 
-    print("\nRunning benchmark on Modal B200...")
-    results = run_benchmark.remote(solution)
+        print("\nRunning benchmark on Modal B200...")
+        results = run_benchmark.remote(solution)
 
-    if not results:
-        print("No results returned!")
-        return
+        if not results:
+            print("No results returned!")
+            continue
 
-    print_results(results)
+        print_results(results)

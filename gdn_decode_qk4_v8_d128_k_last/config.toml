@@ -1,0 +1,9 @@
+[solution]
+name = "gdn-decode-triton-v1"
+definition = "gdn_decode_qk4_v8_d128_k_last"
+author = "emls-ictcas"
+
+[build]
+language = "triton"
+entry_point = "kernel.py::kernel"
+destination_passing_style = true
